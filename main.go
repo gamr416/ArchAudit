@@ -24,7 +24,11 @@ type Config struct {
 	MaxRPS        int
 	PrintInterval time.Duration
 	SLAThreshold  time.Duration
+	SLAExplicit   bool
 	ExploreStep   int
+	Resources1    int
+	Resources2    int
+	StabilityErr  float64
 }
 
 type Phase int
@@ -61,33 +65,39 @@ type Result struct {
 }
 
 type Stats struct {
-	TotalRequests   int64
-	SuccessfulReqs  int64
-	FailedReqs      int64
-	TotalBytes      int64
-	Latencies       []time.Duration
-	LatenciesMu     sync.Mutex
-	StatusCodes     map[int]int64
-	PhaseStats      map[Phase]*PhaseStats
-	mu              sync.RWMutex
-	SLAViolationCnt int64
-	SamplesForP95   int
+	TotalRequests    int64
+	SuccessfulReqs   int64
+	FailedReqs       int64
+	TotalBytes       int64
+	Latencies        []time.Duration
+	LatenciesMu      sync.Mutex
+	StatusCodes      map[int]int64
+	PhaseStats       map[Phase]*PhaseStats
+	mu               sync.RWMutex
+	SLAViolationCnt  int64
+	SamplesForP95    int
+	ErrorRate        float64
+	SLAViolationRate float64
 }
 
 type PhaseStats struct {
-	StartTime     time.Time
-	EndTime       time.Time
-	TotalReqs     int64
-	SuccessReqs   int64
-	FailedReqs    int64
-	AvgLatency    time.Duration
-	P95Latency    time.Duration
-	MinLatencyNs  int64
-	MaxLatencyNs  int64
-	MaxRPS        float64
-	SLAViolations int64
-	Latencies     []time.Duration
-	LatenciesMu   sync.Mutex
+	StartTime        time.Time
+	EndTime          time.Time
+	TotalReqs        int64
+	SuccessReqs      int64
+	FailedReqs       int64
+	AvgLatency       time.Duration
+	P95Latency       time.Duration
+	MinLatencyNs     int64
+	MaxLatencyNs     int64
+	MaxRPS           float64
+	SLAViolations    int64
+	SLAViolationRate float64
+	ErrorRate        float64
+	Latencies        []time.Duration
+	LatenciesMu      sync.Mutex
+	IsStable         bool
+	StabilityTime    time.Time
 }
 
 func (ps *PhaseStats) GetMinLatency() time.Duration {
@@ -124,7 +134,7 @@ func NewPhaseStats() *PhaseStats {
 	}
 }
 
-func (s *Stats) Record(result Result) {
+func (s *Stats) Record(result Result, slaThreshold time.Duration) {
 	atomic.AddInt64(&s.TotalRequests, 1)
 	if result.Success {
 		atomic.AddInt64(&s.SuccessfulReqs, 1)
@@ -181,7 +191,7 @@ func (s *Stats) Record(result Result) {
 		}
 	}
 
-	if result.Latency > 200*time.Millisecond {
+	if result.Latency > slaThreshold {
 		atomic.AddInt64(&s.SLAViolationCnt, 1)
 		atomic.AddInt64(&ps.SLAViolations, 1)
 	}
@@ -229,17 +239,19 @@ func (s *Stats) GetRPS(elapsed time.Duration) float64 {
 }
 
 type PhaseResult struct {
-	StartTime     time.Time
-	EndTime       time.Time
-	TotalReqs     int64
-	SuccessReqs   int64
-	FailedReqs    int64
-	AvgLatency    time.Duration
-	P95Latency    time.Duration
-	MinLatency    time.Duration
-	MaxLatency    time.Duration
-	MaxRPS        float64
-	SLAViolations int64
+	StartTime        time.Time
+	EndTime          time.Time
+	TotalReqs        int64
+	SuccessReqs      int64
+	FailedReqs       int64
+	AvgLatency       time.Duration
+	P95Latency       time.Duration
+	MinLatency       time.Duration
+	MaxLatency       time.Duration
+	MaxRPS           float64
+	SLAViolations    int64
+	SLAViolationRate float64
+	ErrorRate        float64
 }
 
 func (s *Stats) CalculatePhaseStats(phase Phase) PhaseResult {
@@ -251,13 +263,22 @@ func (s *Stats) CalculatePhaseStats(phase Phase) PhaseResult {
 		return PhaseResult{}
 	}
 
+	totalReqs := atomic.LoadInt64(&ps.TotalReqs)
+	failedReqs := atomic.LoadInt64(&ps.FailedReqs)
+	slaViolations := atomic.LoadInt64(&ps.SLAViolations)
+
 	result := PhaseResult{
-		TotalReqs:     atomic.LoadInt64(&ps.TotalReqs),
+		TotalReqs:     totalReqs,
 		SuccessReqs:   atomic.LoadInt64(&ps.SuccessReqs),
-		FailedReqs:    atomic.LoadInt64(&ps.FailedReqs),
-		SLAViolations: atomic.LoadInt64(&ps.SLAViolations),
+		FailedReqs:    failedReqs,
+		SLAViolations: slaViolations,
 		MinLatency:    ps.GetMinLatency(),
 		MaxLatency:    ps.GetMaxLatency(),
+	}
+
+	if totalReqs > 0 {
+		result.ErrorRate = float64(failedReqs) / float64(totalReqs)
+		result.SLAViolationRate = float64(slaViolations) / float64(totalReqs)
 	}
 
 	ps.LatenciesMu.Lock()
@@ -316,86 +337,114 @@ func (s *Stats) Print(elapsed time.Duration, config *Config) {
 	bytes := atomic.LoadInt64(&s.TotalBytes)
 	slaViolations := atomic.LoadInt64(&s.SLAViolationCnt)
 
-	fmt.Println("\n╔════════════════════════════════════════════════════════╗")
-	fmt.Println("║           STRESS TEST RESULTS                          ║")
-	fmt.Println("╠════════════════════════════════════════════════════════╣")
-	fmt.Printf("║  Duration:           %-33v ║\n", elapsed.Round(time.Millisecond))
-	fmt.Printf("║  Total Requests:     %-33d ║\n", total)
-	fmt.Printf("║  Successful:         %-33d ║\n", success)
-	fmt.Printf("║  Failed:             %-33d ║\n", failed)
-	if total > 0 {
-		fmt.Printf("║  Success Rate:       %-33.2f%% ║\n", float64(success)/float64(total)*100)
-	}
-	fmt.Printf("║  Total Data:         %-33.2f KB ║\n", float64(bytes)/1024)
-	fmt.Printf("║  Average RPS:       %-33.2f ║\n", s.GetRPS(elapsed))
-	fmt.Printf("║  P95 Latency:        %-33v ║\n", s.GetP95Latency())
-	fmt.Printf("║  SLA Violations:     %-33d ║\n", slaViolations)
-	fmt.Println("╠════════════════════════════════════════════════════════╣")
-	fmt.Println("║  Status Code Distribution                              ║")
-	s.mu.RLock()
-	for code, count := range s.StatusCodes {
-		fmt.Printf("║    HTTP %d:           %-33d ║\n", code, count)
-	}
-	s.mu.RUnlock()
+	p95 := s.GetP95Latency()
+	rps := s.GetRPS(elapsed)
+	successRate := float64(success) / float64(total) * 100
 
-	fmt.Println("╠════════════════════════════════════════════════════════╣")
-	fmt.Println("║  PHASE ANALYSIS                                        ║")
+	fmt.Println("\n=== TEST SUMMARY ===")
+	fmt.Printf("Total: %d | RPS: %.0f | Time: %v\n", total, rps, elapsed.Round(time.Second))
+	fmt.Printf("Success: %d | Failed: %d | Data: %.1fKB\n", success, failed, float64(bytes)/1024)
+	fmt.Printf("Success Rate: %.2f%% | Error Rate: %.2f%%\n", successRate, 100-successRate)
+	fmt.Printf("P95 Latency: %v | SLA Violations: %.2f%% (%d)\n", p95, float64(slaViolations)/float64(total)*100, slaViolations)
 
+	fmt.Println("\n=== PHASE BREAKDOWN ===")
 	for phase := Phase(0); phase < PhaseComplete; phase++ {
 		ps := s.CalculatePhaseStats(phase)
 		if ps.TotalReqs == 0 {
 			continue
 		}
 		phaseName := []string{"EXPLORE", "STRESS", "RECOVERY"}[phase]
-		fmt.Printf("║  Phase: %s                                          ║\n", phaseName)
-		fmt.Printf("║    Requests: %d | Success: %d | Failed: %d          ║\n", ps.TotalReqs, ps.SuccessReqs, ps.FailedReqs)
-		fmt.Printf("║    Avg Latency: %v | P95: %v | Max: %v            ║\n", ps.AvgLatency, ps.P95Latency, ps.MaxLatency)
-		fmt.Printf("║    Max RPS: %.0f | SLA Violations: %d                ║\n", ps.MaxRPS, ps.SLAViolations)
+		fmt.Printf("%s: %d reqs | RPS: %.0f | P95: %v\n", phaseName, ps.TotalReqs, ps.MaxRPS, ps.P95Latency)
 	}
-
-	fmt.Println("╚════════════════════════════════════════════════════════╝")
 }
 
 type AnalyticalModule struct {
-	stats        *Stats
-	slaThreshold time.Duration
-	bottleneck   string
-	scalingEff   float64
-	recoveryTime time.Duration
+	stats            *Stats
+	slaThreshold     time.Duration
+	bottleneck       string
+	scalingEff       float64
+	recoveryTime     time.Duration
+	errorRate        float64
+	p95Latency       time.Duration
+	slaViolationRate float64
 }
 
-func NewAnalyticalModule(stats *Stats, slaThreshold time.Duration) *AnalyticalModule {
+func NewAnalyticalModule(stats *Stats, slaThreshold time.Duration, resources1, resources2 int, stabilityErrThreshold float64) *AnalyticalModule {
 	return &AnalyticalModule{
 		stats:        stats,
 		slaThreshold: slaThreshold,
 	}
 }
 
-func (am *AnalyticalModule) Analyze() string {
+func (am *AnalyticalModule) Analyze(resources1, resources2 int, stabilityErrThreshold float64) string {
 	am.detectBottleneck()
-	am.calculateScalingEfficiency()
-	am.estimateRecoveryTime()
+	am.calculateScalingEfficiency(resources1, resources2)
+	am.estimateRecoveryTime(am.slaThreshold, stabilityErrThreshold)
+
+	stress := am.stats.CalculatePhaseStats(PhaseStress)
+	am.errorRate = stress.ErrorRate
+	am.p95Latency = stress.P95Latency
+	am.slaViolationRate = stress.SLAViolationRate
 
 	var analysis strings.Builder
 
-	analysis.WriteString("\n╔════════════════════════════════════════════════════════╗\n")
-	analysis.WriteString("║           ARCHITECTURAL ANALYSIS                       ║\n")
-	analysis.WriteString("╠════════════════════════════════════════════════════════╣\n")
-	analysis.WriteString(fmt.Sprintf("║  Bottleneck:         %-33s ║\n", am.bottleneck))
-	analysis.WriteString(fmt.Sprintf("║  Scaling Efficiency: %-33.2f%%                       ║\n", am.scalingEff*100))
-	analysis.WriteString(fmt.Sprintf("║  Recovery Time:     %-33v ║\n", am.recoveryTime))
+	analysis.WriteString("\n=== ARCHITECTURAL METRICS ===\n")
 
-	if am.scalingEff < 0.7 {
-		analysis.WriteString("║  ⚠ WARNING: Poor scaling efficiency!                 ║\n")
+	scalingStatus := "good"
+	if am.scalingEff >= 0.9 {
+		scalingStatus = "excellent"
+	} else if am.scalingEff < 0.7 {
+		scalingStatus = "POOR"
 	}
-	if am.recoveryTime > 30*time.Second {
-		analysis.WriteString("║  ⚠ WARNING: Slow recovery time!                     ║\n")
+	analysis.WriteString(fmt.Sprintf("Scaling Efficiency: %.1f%% [%s]\n", am.scalingEff*100, scalingStatus))
+
+	errStatus := "good"
+	if am.errorRate < 0.01 {
+		errStatus = "excellent"
+	} else if am.errorRate > 0.10 {
+		errStatus = "CRITICAL"
+	} else if am.errorRate > 0.05 {
+		errStatus = "high"
 	}
+	analysis.WriteString(fmt.Sprintf("Error Rate: %.2f%% [%s]\n", am.errorRate*100, errStatus))
+
+	p95Status := "good"
+	if am.p95Latency < 200*time.Millisecond {
+		p95Status = "excellent"
+	} else if am.p95Latency > 1*time.Second {
+		p95Status = "CRITICAL"
+	} else if am.p95Latency > 500*time.Millisecond {
+		p95Status = "high"
+	}
+	analysis.WriteString(fmt.Sprintf("P95 Latency: %v [%s]\n", am.p95Latency, p95Status))
+
+	slaStatus := "good"
+	if am.slaViolationRate < 0.01 {
+		slaStatus = "excellent"
+	} else if am.slaViolationRate > 0.05 {
+		slaStatus = "CRITICAL"
+	} else if am.slaViolationRate > 0.03 {
+		slaStatus = "high"
+	}
+	analysis.WriteString(fmt.Sprintf("SLA Violations: %.2f%% [%s]\n", am.slaViolationRate*100, slaStatus))
+
+	recStatus := "good"
+	if am.recoveryTime < 30*time.Second {
+		recStatus = "excellent"
+	} else if am.recoveryTime > 120*time.Second {
+		recStatus = "SLOW"
+	} else if am.recoveryTime > 30*time.Second {
+		recStatus = "normal"
+	}
+	analysis.WriteString(fmt.Sprintf("Recovery Time: %v [%s]\n", am.recoveryTime.Round(time.Second), recStatus))
+
+	analysis.WriteString("\n")
 	if am.bottleneck != "None" {
-		analysis.WriteString(fmt.Sprintf("║  Recommendation: Optimize %s                      ║\n", am.bottleneck))
+		analysis.WriteString(fmt.Sprintf("Bottleneck: %s\n", am.bottleneck))
+		analysis.WriteString(fmt.Sprintf("Action: Optimize %s\n", am.bottleneck))
+	} else {
+		analysis.WriteString("Bottleneck: None detected\n")
 	}
-
-	analysis.WriteString("╚════════════════════════════════════════════════════════╝\n")
 
 	return analysis.String()
 }
@@ -409,19 +458,19 @@ func (am *AnalyticalModule) detectBottleneck() {
 		return
 	}
 
-	errorRate := float64(stress.FailedReqs) / float64(stress.TotalReqs)
-
 	switch {
-	case errorRate > 0.15:
+	case stress.ErrorRate > 0.10:
+		am.bottleneck = "Critical Error Rate"
+	case stress.ErrorRate > 0.05:
 		am.bottleneck = "High Error Rate"
-	case stress.MaxLatency > 10*time.Second:
-		am.bottleneck = "Server Timeout"
-	case stress.MaxLatency > 5*time.Second:
-		am.bottleneck = "High Latency"
+	case stress.P95Latency > 1*time.Second:
+		am.bottleneck = "Critical P95 Latency"
+	case stress.P95Latency > 500*time.Millisecond:
+		am.bottleneck = "High P95 Latency"
 	case stress.AvgLatency > 500*time.Millisecond:
 		am.bottleneck = "Slow Response"
-	case stress.P95Latency > 1*time.Second:
-		am.bottleneck = "High P95 Latency"
+	case stress.SLAViolationRate > 0.05:
+		am.bottleneck = "SLA Violations"
 	case stress.MaxRPS < 1000 && stress.TotalReqs > 1000:
 		am.bottleneck = "Low Throughput"
 	case explore.TotalReqs > 0 && stress.MaxRPS < explore.MaxRPS*1.5:
@@ -431,7 +480,7 @@ func (am *AnalyticalModule) detectBottleneck() {
 	}
 }
 
-func (am *AnalyticalModule) calculateScalingEfficiency() {
+func (am *AnalyticalModule) calculateScalingEfficiency(resources1, resources2 int) {
 	explore := am.stats.CalculatePhaseStats(PhaseExplore)
 	stress := am.stats.CalculatePhaseStats(PhaseStress)
 
@@ -448,28 +497,39 @@ func (am *AnalyticalModule) calculateScalingEfficiency() {
 		return
 	}
 
-	exploreRPS := float64(explore.TotalReqs) / exploreDuration.Seconds()
-	stressRPS := float64(stress.TotalReqs) / stressDuration.Seconds()
+	rps1 := float64(explore.TotalReqs) / exploreDuration.Seconds()
+	rps2 := float64(stress.TotalReqs) / stressDuration.Seconds()
 
-	if exploreRPS <= 0 {
+	if rps1 <= 0 {
 		am.scalingEff = 0
 		return
 	}
 
-	idealRPS := exploreRPS * 4
-	am.scalingEff = stressRPS / idealRPS
-	if am.scalingEff > 1 {
-		am.scalingEff = 1
+	if resources1 <= 0 {
+		resources1 = 1
 	}
+	if resources2 <= 0 {
+		resources2 = resources1 * 4
+	}
+
+	rpsRatio := rps2 / rps1
+	resourceRatio := float64(resources2) / float64(resources1)
+	am.scalingEff = rpsRatio / resourceRatio
 }
 
-func (am *AnalyticalModule) estimateRecoveryTime() {
+func (am *AnalyticalModule) estimateRecoveryTime(slaThreshold time.Duration, stabilityErrThreshold float64) {
 	recovery := am.stats.CalculatePhaseStats(PhaseRecovery)
 	if recovery.TotalReqs == 0 {
 		am.recoveryTime = 0
 		return
 	}
-	am.recoveryTime = recovery.EndTime.Sub(recovery.StartTime)
+
+	isStable := recovery.ErrorRate < stabilityErrThreshold && recovery.P95Latency < slaThreshold
+	if isStable {
+		am.recoveryTime = recovery.EndTime.Sub(recovery.StartTime)
+	} else {
+		am.recoveryTime = recovery.EndTime.Sub(recovery.StartTime)
+	}
 }
 
 func worker(id int, ctx context.Context, client *http.Client, jobs <-chan Job, results chan<- Result, wg *sync.WaitGroup) {
@@ -566,17 +626,16 @@ func runPhase(ctx context.Context, client *http.Client, config *Config, phase Ph
 
 	var resultWg sync.WaitGroup
 	resultWg.Add(1)
+	slaThreshold := config.SLAThreshold
 	go func() {
 		defer resultWg.Done()
 		for result := range results {
-			stats.Record(result)
+			stats.Record(result, slaThreshold)
 		}
 	}()
 
-	fmt.Printf("\n>>> Starting Phase: %s\n", phaseConfig.Name)
-	fmt.Printf("    Duration: %v | Target RPS: %d | Workers: %d\n",
-		phaseConfig.Duration, phaseConfig.TargetRPS, workers)
-	fmt.Printf("    %s\n\n", phaseConfig.Description)
+	fmt.Printf("\n=== %s Phase ===\n", phaseConfig.Name)
+	fmt.Printf("Duration: %v | Target RPS: %d | Workers: %d\n", phaseConfig.Duration, phaseConfig.TargetRPS, workers)
 
 	startTime := time.Now()
 	phaseCtx, cancel := context.WithTimeout(ctx, phaseConfig.Duration)
@@ -635,23 +694,33 @@ done:
 	resultWg.Wait()
 
 	ps := stats.CalculatePhaseStats(phase)
-	fmt.Printf("\n<<< Phase Complete: %s | Requests: %d | RPS: %.0f | P95: %v\n",
+	fmt.Printf("--- %s done: %d reqs | RPS: %.0f | P95: %v\n",
 		phaseConfig.Name, ps.TotalReqs, ps.MaxRPS, ps.P95Latency)
 }
 
 func main() {
 	var (
-		urlsFlag     = flag.String("urls", "", "Comma-separated list of URLs to test")
-		urlsFileFlag = flag.String("urls-file", "", "File containing URLs (one per line)")
-		durationFlag = flag.Duration("duration", 2*time.Minute, "Total test duration")
-		workersFlag  = flag.Int("workers", 0, "Number of workers (0 = auto-adaptive)")
-		timeoutFlag  = flag.Duration("timeout", 10*time.Second, "HTTP client timeout")
-		maxRPSFlag   = flag.Int("max-rps", 0, "Maximum RPS for stress phase (0 = unlimited)")
-		intervalFlag = flag.Duration("print-interval", 5*time.Second, "Stats print interval")
-		slaFlag      = flag.Duration("sla", 200*time.Millisecond, "SLA threshold for latency")
-		exploreFlag  = flag.Int("explore-step", 4, "Load multiplier for exploration phase")
+		urlsFlag         = flag.String("urls", "", "Comma-separated list of URLs to test")
+		urlsFileFlag     = flag.String("urls-file", "", "File containing URLs (one per line)")
+		durationFlag     = flag.Duration("duration", 2*time.Minute, "Total test duration")
+		workersFlag      = flag.Int("workers", 0, "Number of workers (0 = auto-adaptive)")
+		timeoutFlag      = flag.Duration("timeout", 10*time.Second, "HTTP client timeout")
+		maxRPSFlag       = flag.Int("max-rps", 0, "Maximum RPS for stress phase (0 = unlimited)")
+		intervalFlag     = flag.Duration("print-interval", 5*time.Second, "Stats print interval")
+		slaFlag          = flag.Duration("sla", 200*time.Millisecond, "SLA threshold for latency")
+		exploreFlag      = flag.Int("explore-step", 4, "Load multiplier for exploration phase")
+		resources1Flag   = flag.Int("resources1", 1, "Resources in explore phase (e.g., 1 server)")
+		resources2Flag   = flag.Int("resources2", 4, "Resources in stress phase (e.g., 4 servers)")
+		stabilityErrFlag = flag.Float64("stability-err", 0.05, "Error rate threshold for stability (0.05 = 5%)")
 	)
 	flag.Parse()
+
+	slaExplicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "sla" {
+			slaExplicit = true
+		}
+	})
 
 	config := Config{
 		Duration:      *durationFlag,
@@ -660,7 +729,11 @@ func main() {
 		MaxRPS:        *maxRPSFlag,
 		PrintInterval: *intervalFlag,
 		SLAThreshold:  *slaFlag,
+		SLAExplicit:   slaExplicit,
 		ExploreStep:   *exploreFlag,
+		Resources1:    *resources1Flag,
+		Resources2:    *resources2Flag,
+		StabilityErr:  *stabilityErrFlag,
 	}
 
 	if *urlsFlag != "" {
@@ -678,17 +751,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println("╔════════════════════════════════════════════════════════╗")
-	fmt.Println("║        ArchAudit - STRESS TESTER                     ║")
-	fmt.Println("╠════════════════════════════════════════════════════════╣")
-	fmt.Printf("║  Target URLs:        %-33d ║\n", len(config.URLs))
-	fmt.Printf("║  Duration:          %-33v ║\n", config.Duration)
-	fmt.Printf("║  SLA Threshold:     %-33v ║\n", config.SLAThreshold)
-	fmt.Printf("║  Worker Mode:       %-33s ║\n", "adaptive")
-	if config.MaxRPS > 0 {
-		fmt.Printf("║  Target RPS:        %-33d ║\n", config.MaxRPS)
+	fmt.Println("=== ArchAudit ===")
+	if config.SLAExplicit {
+		fmt.Printf("URLs: %d | Duration: %v | SLA: %v | Target RPS: %d\n", len(config.URLs), config.Duration, config.SLAThreshold, config.MaxRPS)
+	} else {
+		fmt.Printf("URLs: %d | Duration: %v | Target RPS: %d\n", len(config.URLs), config.Duration, config.MaxRPS)
 	}
-	fmt.Println("╚════════════════════════════════════════════════════════╝")
+	fmt.Printf("Resources: %d -> %d | Stability Error: %.0f%%\n", config.Resources1, config.Resources2, config.StabilityErr*100)
 	fmt.Println()
 
 	client := &http.Client{
@@ -721,8 +790,8 @@ func main() {
 	elapsed := time.Since(startTime)
 	stats.Print(elapsed, &config)
 
-	analytics := NewAnalyticalModule(stats, config.SLAThreshold)
-	fmt.Print(analytics.Analyze())
+	analytics := NewAnalyticalModule(stats, config.SLAThreshold, config.Resources1, config.Resources2, config.StabilityErr)
+	fmt.Print(analytics.Analyze(config.Resources1, config.Resources2, config.StabilityErr))
 }
 
 func getPhaseFromName(name string) Phase {
