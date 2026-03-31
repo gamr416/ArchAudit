@@ -1,6 +1,6 @@
-# ArchAudit — Высокопроизводительный HTTP Stress-тестировщик
+# ArchAudit — HTTP Stress-тестировщик
 
-Инструмент для нагрузочного тестирования HTTP-сервисов на Go с трёхфазной методологией тестирования и автоматическим анализом архитектуры.
+Инструмент для нагрузочного тестирования HTTP-сервисов на Go с трёхфазной методологией и автоматическим анализом архитектуры.
 
 ## Возможности
 
@@ -9,7 +9,6 @@
 - **Высокоточное планирование**: интервал 1мс для точного контроля RPS
 - **Поддержка множества URL**: тестирование одного или нескольких endpoints
 - **Ограничение RPS**: опциональный лимит запросов в секунду
-- **Отслеживание SLA**: мониторинг нарушений с настраиваемым порогом
 - **P95 Latency**: отслеживание перцентильной задержки
 - **Аналитический модуль**: автоматическое определение узких мест
 - **Анализ восстановления**: измерение времени восстановления после пиковой нагрузки
@@ -19,13 +18,13 @@
 ## Установка
 
 ```bash
-go install github.com/yourusername/archaudit@latest
+go install github.com/gamr416/archaudit@latest
 ```
 
 Или соберите вручную:
 
 ```bash
-git clone https://github.com/yourusername/ArchAudit.git
+git clone https://github.com/gamr416/ArchAudit.git
 cd ArchAudit
 go build -o archaudit main.go
 ```
@@ -48,9 +47,11 @@ archaudit -urls <URL> -duration <ПРОДОЛЖИТЕЛЬНОСТЬ> [опции
 | `-workers` | Количество воркеров (0 = авто) | 0 |
 | `-timeout` | Таймаут HTTP-клиента | 10s |
 | `-max-rps` | Целевая RPS для стресс-фазы | 1000 |
-| `-sla` | Порог SLA для задержки | 200ms |
+| `-sla` | Порог SLA для задержки | (не задан) |
 | `-explore-step` | Множитель нагрузки для explore | 4 |
-| `-print-interval` | Интервал вывода статистики | 5s |
+| `-resources1` | Ресурсы в фазе explore (серверов/pods) | 1 |
+| `-resources2` | Ресурсы в фазе stress | 4 |
+| `-stability-err` | Порог ошибок для стабильности | 0.05 (5%) |
 
 ## Примеры использования
 
@@ -60,13 +61,19 @@ archaudit -urls <URL> -duration <ПРОДОЛЖИТЕЛЬНОСТЬ> [опции
 archaudit -urls http://localhost:8080/api -duration 2m -max-rps 5000
 ```
 
-### Быстрый тест с отслеживанием SLA
+### Тест с SLA
 
 ```bash
 archaudit -urls http://localhost:8080/health -duration 30s -max-rps 1000 -sla 100ms
 ```
 
-### Высоконагруженное тестирование (20k+ RPS)
+### Тест с масштабированием
+
+```bash
+archaudit -urls http://localhost:8080/api -duration 2m -max-rps 5000 -resources1 1 -resources2 8
+```
+
+### Высоконагруженное тестирование
 
 ```bash
 archaudit -urls http://localhost:8080/api -duration 1m -max-rps 20000
@@ -87,7 +94,6 @@ archaudit -urls-file urls.txt -duration 5m -max-rps 10000
 ### Файл urls.txt
 
 ```
-# Комментарии начинаются с #
 http://localhost:8080/api/endpoint1
 http://localhost:8080/api/endpoint2
 http://localhost:8080/health
@@ -99,117 +105,92 @@ http://localhost:8080/health
 - Постепенное увеличение нагрузки
 - Определение пределов системы
 - Целевая RPS = max-rps / explore-step
-- Выявление базовых показателей производительности
 
 ### 2. Фаза STRESS (~60% времени)
 - Продолжительная пиковая нагрузка
 - Поиск точек отказа и узких мест
 - Измерение P95 задержки под нагрузкой
-- Определение максимальной пропускной способности
 
 ### 3. Фаза RECOVERY (~15% времени)
 - Сниженная нагрузка (10% от пика)
 - Измерение времени восстановления системы
-- Оценка способности к самовосстановлению
+
+## Метрики архитектурной устойчивости
+
+### Формулы
+
+| Метрика | Формула |
+|---------|---------|
+| **Scaling Efficiency** | `(RPS₂ / RPS₁) / (Resources₂ / Resources₁)` |
+| **Error Rate** | `FailedRequests / TotalRequests` |
+| **P95 Latency** | 95-й перцентиль всех задержек |
+| **SLA Violations** | `Requests(latency > SLA) / TotalRequests` |
+| **Recovery Time** | `T_stable - T_load_end` (при ErrorRate < 5% и P95 < SLA) |
+
+### Пороги
+
+| Метрика | Отлично | Приемлемо | Плохо |
+|---------|---------|-----------|-------|
+| Scaling Efficiency | >90% | 70-90% | <70% |
+| Error Rate | <1% | 1-5% | >5% |
+| P95 Latency | <200ms | 200-500ms | >500ms |
+| SLA Violations | <1% | 1-3% | >3% |
+| Recovery Time | <30s | 30-120s | >120s |
 
 ## Интерпретация результатов
 
-### Статистика запросов
+### Пример вывода
 
 ```
-╔════════════════════════════════════════════════════════╗
-║           РЕЗУЛЬТАТЫ НАГРУЗОЧНОГО ТЕСТА                ║
-╠════════════════════════════════════════════════════════╣
-║  Duration:           2m0s                              ║
-║  Total Requests:     150,000                          ║
-║  Successful:         149,850                           ║
-║  Failed:             150                              ║
-║  Success Rate:       99.90%                           ║
-║  P95 Latency:        45ms                              ║
-║  SLA Violations:     1,250                             ║
-╠════════════════════════════════════════════════════════╣
-║  PHASE ANALYSIS                                        ║
-║  Phase: EXPLORE                                         ║
-║    Requests: 37500 | Max RPS: 1250 | P95: 25ms        ║
-║  Phase: STRESS                                          ║
-║    Requests: 90000 | Max RPS: 5000 | P95: 45ms        ║
-║  Phase: RECOVERY                                        ║
-║    Requests: 22500 | Max RPS: 500 | P95: 30ms         ║
-╚════════════════════════════════════════════════════════╝
+=== ArchAudit ===
+URLs: 1 | Duration: 2m | SLA: 200ms | Target RPS: 5000
+Resources: 1 -> 4 | Stability Error: 5%
+
+=== EXPLORE Phase ===
+Duration: 30s | Target RPS: 1250 | Workers: 1000
+--- EXPLORE done: 37500 reqs | RPS: 1250 | P95: 25ms
+
+=== STRESS Phase ===
+Duration: 90s | Target RPS: 5000 | Workers: 2500
+--- STRESS done: 450000 reqs | RPS: 5000 | P95: 45ms
+
+=== RECOVERY Phase ===
+Duration: 30s | Target RPS: 500 | Workers: 500
+--- RECOVERY done: 15000 reqs | RPS: 500 | P95: 30ms
+
+=== TEST SUMMARY ===
+Total: 502500 | RPS: 4187 | Time: 2m30s
+Success: 502350 | Failed: 150 | Data: 125625.0KB
+Success Rate: 99.97% | Error Rate: 0.03%
+P95 Latency: 45ms | SLA Violations: 0.00% (0)
+
+=== PHASE BREAKDOWN ===
+EXPLORE: 37500 reqs | RPS: 1250 | P95: 25ms
+STRESS: 450000 reqs | RPS: 5000 | P95: 45ms
+RECOVERY: 15000 reqs | RPS: 500 | P95: 30ms
+
+=== ARCHITECTURAL METRICS ===
+Scaling Efficiency: 100.0% [excellent]
+Error Rate: 0.03% [excellent]
+P95 Latency: 45ms [excellent]
+SLA Violations: 0.00% [excellent]
+Recovery Time: 15s [excellent]
+
+Bottleneck: None detected
 ```
 
-### Анализ архитектуры
+### Определение узких мест
 
-```
-╔════════════════════════════════════════════════════════╗
-║           АРХИТЕКТУРНЫЙ АНАЛИЗ                         ║
-╠════════════════════════════════════════════════════════╣
-║  Bottleneck:         High P95 Latency                 ║
-║  Scaling Efficiency: 87.50%                           ║
-║  Recovery Time:     15s                               ║
-║  ⚠ WARNING: P95 latency exceeded SLA threshold       ║
-║  Recommendation: Optimize High P95 Latency            ║
-╚════════════════════════════════════════════════════════╝
-```
-
-## Аналитический модуль
-
-Автоматически анализирует и определяет:
-
-### Определение узких мест (Bottleneck)
-| Тип | Описание |
-|-----|----------|
-| High Error Rate | Ошибка > 15% запросов |
-| Server Timeout | Макс. задержка > 10 сек |
-| High Latency | Макс. задержка > 5 сек |
-| Slow Response | Средняя задержка > 500 мс |
-| High P95 Latency | P95 > 1 сек |
+| Bottleneck | Условие |
+|------------|---------|
+| Critical Error Rate | Error Rate > 10% |
+| High Error Rate | Error Rate > 5% |
+| Critical P95 Latency | P95 > 1s |
+| High P95 Latency | P95 > 500ms |
+| Slow Response | Avg Latency > 500ms |
+| SLA Violations | SLA Violations > 5% |
 | Low Throughput | RPS < 1000 при >1000 запросов |
-| Poor Scaling | RPS stress < RPS explore × 1.5 |
-
-### Эффективность масштабирования (Scaling Efficiency)
-- Измеряет, насколько хорошо система масштабируется от фазы explore к stress
-- > 90%: отлично
-- 70-90%: хорошо
-- < 70%: требуется оптимизация
-
-### Время восстановления (Recovery Time)
-- Время, необходимое системе для возврата к нормальной работе после пиковой нагрузки
-- < 10 сек: отлично
-- 10-30 сек: приемлемо
-- > 30 сек: требует внимания
-
-## Производительность
-
-- **Максимальная RPS**: 185,000+ (с быстрым backend)
-- **Пул соединений**: 10,000 idle соединений
-- **Масштабирование воркеров**: адаптивное от 10 до 500
-- **Точность**: ±3% RPS с 1мс планировщиком
-
-## Архитектура
-
-```
-┌─────────────┐    jobs     ┌──────────┐    results    ┌─────────────┐
-│  Scheduler  │ ─────────► │ Workers  │ ────────────► │   Stats     │
-│  (1ms)      │   (chan)   │ (adaptive)  │  (atomic)   │  Collector  │
-└─────────────┘            └──────────┘               └─────────────┘
-                               │
-                          ┌────▼────┐
-                          │ Analytical│
-                          │ Module   │
-                          └─────────┘
-```
-
-## Сравнение с альтернативами
-
-| Функция | ArchAudit | wrk | k6 |
-|---------|-----------|-----|-----|
-| Go-базированный | ✅ | ❌ | ✅ |
-| Трёхфазное тестирование | ✅ | ❌ | ❌ |
-| Автоанализ архитектуры | ✅ | ❌ | ❌ |
-| Без внешних зависимостей | ✅ | ❌ | ❌ |
-| Адаптивные воркеры | ✅ | ❌ | ❌ |
-| Анализ восстановления | ✅ | ❌ | ❌ |
+| Poor Scaling | RPS_stress < RPS_explore × 1.5 |
 
 ## Советы по использованию
 
@@ -222,6 +203,11 @@ http://localhost:8080/health
 - Критичные API: 50-100ms
 - Стандартные API: 100-200ms
 - Фоновые задачи: 200-500ms
+
+### Настройка ресурсов
+Для корректного расчёта Scaling Efficiency укажите количество ресурсов:
+- `-resources1 1` — 1 сервер в фазе explore
+- `-resources2 4` — 4 сервера в фазе stress
 
 ### Рекомендуемая продолжительность
 - Быстрый тест: 30 секунд
